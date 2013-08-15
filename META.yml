@@ -1,7 +1,7 @@
 ---
 abstract: "A simple non-threaded, non-OO, pre-forking,\nself-regulating, multi-purpose multi-processing module. Period."
 author:
-  - 'Carsten Gaebler <cgpan@gmx.de>'
+  - 'Carsten Gaebler'
 build_requires:
   Test::More: 0
 configure_requires:
@@ -16,9 +16,9 @@ name: Parallel-MPM-Prefork
 provides:
   Parallel::MPM::Prefork:
     file: lib/Parallel/MPM/Prefork.pm
-    version: 0.08
+    version: 0.09
 requires:
-  perl: 5.006
+  perl: 5.010
 resources:
   license: http://dev.perl.org/licenses/
-version: 0.08
+version: 0.09

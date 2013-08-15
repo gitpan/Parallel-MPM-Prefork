@@ -1,4 +1,17 @@
 Revision history for Parallel-MPM-Prefork
 
-0.08    2013-08-14
-        Initial CPAN release.
+0.09  2013-08-15
+* Include Perl 5.10 as requirement in Build.PL
+* Don't import POSIX::_exit, we don't need it.
+* Changed CLD_DATA_HDR_FMT from 'SSCL' to 'iSCL' b/c pid_t is an unsigned int.
+* _read_child_data(): Absorb all remaining child data if header is corrupt.
+* pf_whip_kids(), pf_kid_new(): Don't kill surplus children after they exited
+  voluntarily.
+* Reworked SIGCHLD handling to fix just-before-select() race condition and
+  to be immune to missed SIGCHLDs.
+* Removed no_sigchld_handler option, it's too messy.
+* Mention POSIX::PIPE_BUF in pf_kid_yell() documentation.
+* Cosmetics.
+
+0.08  2013-08-14
+Initial CPAN release.

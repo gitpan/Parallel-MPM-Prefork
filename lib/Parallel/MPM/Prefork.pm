@@ -1,13 +1,15 @@
 package Parallel::MPM::Prefork;
 
-use v5.10.0;
+use 5.010;
 use strict;
 use warnings;
 use Exporter 'import';
 use Fcntl;
-use POSIX qw(:signal_h :sys_wait_h _exit sigprocmask);
+use POSIX qw(:signal_h :sys_wait_h sigprocmask);
 use Socket;
 use Storable qw(nfreeze thaw);
+
+use Data::Dumper;
 
 use constant {
   MAX_SERVERS => 73,
@@ -16,7 +18,7 @@ use constant {
   START_SERVERS => 5,
 };
 
-use constant CLD_DATA_HDR_FMT => 'SSCL'; # PID, exit code, thaw, data length
+use constant CLD_DATA_HDR_FMT => 'iSCL'; # PID, exit code, thaw, data length
 use constant CLD_DATA_HDR_LEN => length pack CLD_DATA_HDR_FMT, 0;
 
 our (@EXPORT_OK, @EXPORT_TAGS) = ();
@@ -32,14 +34,15 @@ our @EXPORT =
       pf_kid_exit
   );
 
-our $VERSION = '0.08';
+our $VERSION = '0.09';
 our $error;
 
 my $pgid;
 my $done;
 my $debug;
 my $am_parent;
-my $no_sigchld_handler;
+my $timeout;
+my $got_sigchld;
 
 my $max_servers;
 my $max_spare_servers;
@@ -62,6 +65,7 @@ my %busy;
 my %idle;
 
 my $sigset_bak = POSIX::SigSet->new();
+my $sigset_chld = POSIX::SigSet->new(POSIX::SIGCHLD);
 my $sigset_all = POSIX::SigSet->new();
 $sigset_all->fillset();
 
@@ -80,11 +84,11 @@ sub pf_init {
     $am_parent = 1;
     $done = $num_busy = $num_idle = 0;
 
+    undef $timeout;
     undef %busy;
     undef %idle;
 
     $debug = $opts{debug};
-    $no_sigchld_handler = $opts{no_sigchld_handler};
 
     # Just like Apache, we allow start_servers to be larger than
     # max_spare_servers to accommodate for high initial load.
@@ -131,7 +135,7 @@ sub pf_init {
     vec($child_fds, fileno $child_stat_fh, 1) = 1;
     vec($child_fds, fileno $child_data_fh, 1) = 1 if $child_data_hook;
 
-    $SIG{CHLD} = sub { _wait_for_children(WNOHANG) } if ! $no_sigchld_handler;
+    $SIG{CHLD} = \&_sig_chld;
     _wait_for_children(WNOHANG)
   };
 
@@ -160,7 +164,12 @@ sub pf_whip_kids ($;$) {
   }
   elsif ((my $plus = $num_idle - $max_spare_servers) > 0) {
     _log_child_action('Killing', $plus) if $debug;
-    kill 'TERM', (keys %idle)[0 .. --$plus];
+    # If some children exited between the calculation of $plus and the
+    # buildup of @ilders, %idle may contain less than $plus keys and @idlers
+    # has trailing undef elements. In this case we do not need to kill
+    # anyone.
+    my @idlers = (keys %idle)[0 .. --$plus];
+    kill 'TERM', @idlers if $idlers[-1];
   }
 
   _log_child_status() if $debug;
@@ -182,7 +191,8 @@ sub pf_kid_new () {
     }
     elsif ((my $plus = $num_idle - $max_spare_servers) > 0) {
       _log_child_action('Killing', $plus) if $debug;
-      kill 'TERM', (keys %idle)[0 .. --$plus];
+      my @idlers = (keys %idle)[0 .. --$plus];
+      kill 'TERM', @idlers if $idlers[-1];
     }
 
     _log_child_status() if $debug;
@@ -221,8 +231,7 @@ sub pf_kid_exit(;$$$) {
 
   return if $am_parent;
 
-  $exitcode //= 0;
-  $exitcode &= 0xff;
+  ($exitcode //= 0) &= 0xff;
 
   pf_kid_yell($data, $thaw, $exitcode);
 
@@ -259,16 +268,6 @@ sub pf_done (;$) {
 #
 # Private parts
 #
-
-sub _wait_for_children {
-  my $flags = shift // 0;
-
-  while ((my $pid = waitpid -$pgid, $flags) > 0) {
-    delete $busy{$pid} and $num_busy--;
-    delete $idle{$pid} and $num_idle--;
-    warn "PID $pid exited.\n" if $debug;
-  }
-}
 
 sub _make_child_sigh {
   my $child_sigh = shift // return undef;
@@ -360,10 +359,16 @@ sub _read_child_data {
 
   while (sysread $child_data_fh, my $header, CLD_DATA_HDR_LEN) {
     my ($pid, $exitcode, $thaw, $data_len) = unpack CLD_DATA_HDR_FMT, $header;
-    if ($pid <= 1 || $exitcode > 256 || $thaw > 1 || $data_len == 0) {
-      warn 'ERROR: read corrupted child data: ',
-        "pid:$pid exitcode:$exitcode thaw:$thaw data_len:$data_len";
-      next if $data_len == 0;
+
+    # Exit code 256 means "undef", minimum nfreeze() data length is 3.
+    if ($pid <= 1 || $exitcode > 256 || $thaw > 1 || $data_len < 3) {
+      warn(
+        'ERROR: read corrupted child data: ',
+        "pid:$pid exitcode:$exitcode thaw:$thaw data_len:$data_len",
+        ", skipping all pending data"
+      );
+      1 while sysread $child_data_fh, $header, 16384;
+      last;
     }
 
     my $nbytes = sysread $child_data_fh, (my $data), $data_len;
@@ -392,13 +397,38 @@ sub _read_child_data {
 }
 
 sub _read_child_drool {
-  _wait_for_children(WNOHANG) if $no_sigchld_handler;
-  select my $readfds = $child_fds, undef, undef, undef;
+  select my $readfds = $child_fds, undef, undef, $timeout;
+
+  _wait_for_children(WNOHANG) if $got_sigchld;
+
   sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
   _read_child_status();
   _read_child_data();
   sigprocmask(SIG_SETMASK, $sigset_bak);
-  _wait_for_children(WNOHANG) if $no_sigchld_handler;
+
+  _wait_for_children(WNOHANG) if $got_sigchld;
+}
+
+sub _sig_chld {
+  $timeout = 0;
+  ++$got_sigchld;
+}
+
+sub _wait_for_children {
+  my $flags = shift // 0;
+
+  sigprocmask(SIG_BLOCK, $sigset_chld, $sigset_bak);
+
+  while ((my $pid = waitpid -$pgid, $flags) > 0) {
+    delete $busy{$pid} and $num_busy--;
+    delete $idle{$pid} and $num_idle--;
+    warn "PID $pid exited.\n" if $debug;
+  }
+
+  undef $got_sigchld;
+  undef $timeout;
+
+  sigprocmask(SIG_SETMASK, $sigset_bak);
 }
 
 sub _log_child_action {
@@ -539,11 +569,6 @@ from Storable::nfreeze().
 Note that this hook executes in the main process and thus may slow down child
 process handling, so keep the code and data as small as possible
 
-=head3 no_sigchld_handler
-
-Boolean value. If true, pf_init() does not install a SIGCHLD handler (see
-NOTES).
-
 =head2 pf_whip_kids () and pf_kid_new ()
 
 These two functions manage the child processes. Which one you use is up to
@@ -642,10 +667,11 @@ This function is a no-op in the main process, if child_data_hook is not set or
 if C<$data> is not a reference.
 
 As all child processes share the same upstream socket to the parent you should
-probably not send more than a few kB in one go. Otherwise the data might be
-split up in smaller chunks and get intermixed with data from other child
-processes sending at the same time. While this could be avoided with some
-extra effort I prefer to keep it simple.
+probably not send more than POSIX::PIPE_BUF bytes in one go if your children
+are nerve-racking blare machines. Otherwise the data might be split up in
+smaller chunks and get intermixed with data from other child processes sending
+at the same time. While this could be avoided with some extra effort I prefer
+to keep it simple.
 
 =head3 $data (required)
 
@@ -686,12 +712,6 @@ Parallel::MPM::Prefork relies on SIGCHLD being delivered to its own handler in
 the main process (installed by pf_init()) and select() being interrupted by at
 least SIGCHLD.
 
-If you still want to install your own SIGCHLD handler, you can call pf_init()
-with the no_sigchld_handler option set to a true value.
-Parallel::MPM::Prefork will then try hard to collect finished child processes
-but there remains a race condition. So use this at your own peril and be
-prepared to mess it all up especially under higher load. You have been warned.
-
 =head2 Forking your own processes
 
 Parallel::MPM::Prefork creates a process group with setpgrp() which allows it
@@ -701,8 +721,8 @@ waitpid($pid, ...) in the main process.
 
 system(LIST) can be replaced by system('setsid', LIST);
 
-However, Parallel::MPM::Prefork will still catch your SIGCHLD (but see
-previous note).
+However, Parallel::MPM::Prefork will still catch your SIGCHLD (see previous
+note).
 
 =head2 Difference to Parallel::ForkManager
 
