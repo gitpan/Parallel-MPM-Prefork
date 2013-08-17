@@ -34,7 +34,7 @@ our @EXPORT =
       pf_kid_exit
   );
 
-our $VERSION = '0.09';
+our $VERSION = '0.10';
 our $error;
 
 my $pgid;
@@ -42,7 +42,6 @@ my $done;
 my $debug;
 my $am_parent;
 my $timeout;
-my $got_sigchld;
 
 my $max_servers;
 my $max_spare_servers;
@@ -59,13 +58,15 @@ my $child_fds;
 my $child_data_hook;
 my $child_sigh;
 
+my $dhook_in_main;
+my $dhook_pid;
+
 my $num_busy;
 my $num_idle;
 my %busy;
 my %idle;
 
 my $sigset_bak = POSIX::SigSet->new();
-my $sigset_chld = POSIX::SigSet->new(POSIX::SIGCHLD);
 my $sigset_all = POSIX::SigSet->new();
 $sigset_all->fillset();
 
@@ -80,11 +81,10 @@ sub pf_init {
     setpgrp();
     $pgid = getpgrp();
 
-    $error = '';
-    $am_parent = 1;
-    $done = $num_busy = $num_idle = 0;
+    $child_fds = $error = '';
+    $timeout = $am_parent = 1;
+    $dhook_pid = $done = $num_busy = $num_idle = 0;
 
-    undef $timeout;
     undef %busy;
     undef %idle;
 
@@ -127,16 +127,23 @@ sub pf_init {
     }
 
     $child_sigh = _make_child_sigh($opts{child_sigh});
+    $dhook_in_main = $opts{data_hook_in_main};
 
-    _make_socketpair($parent_stat_fh, $child_stat_fh);
-    _make_socketpair($parent_data_fh, $child_data_fh) if $child_data_hook;
+    if ($child_data_hook) {
+      _socketpair($parent_data_fh, $child_data_fh);
+      if ($dhook_in_main) {
+        vec($child_fds, fileno $child_data_fh, 1) = 1;
+      }
+      else {
+        $dhook_pid = _fork_data_hook_helper($parent_data_fh, $child_data_fh);
+      }
+    }
 
-    $child_fds = '';
+    _socketpair($parent_stat_fh, $child_stat_fh);
     vec($child_fds, fileno $child_stat_fh, 1) = 1;
-    vec($child_fds, fileno $child_data_fh, 1) = 1 if $child_data_hook;
 
     $SIG{CHLD} = \&_sig_chld;
-    _wait_for_children(WNOHANG)
+    _wait_for_children()
   };
 
   if ($@) {
@@ -164,12 +171,7 @@ sub pf_whip_kids ($;$) {
   }
   elsif ((my $plus = $num_idle - $max_spare_servers) > 0) {
     _log_child_action('Killing', $plus) if $debug;
-    # If some children exited between the calculation of $plus and the
-    # buildup of @ilders, %idle may contain less than $plus keys and @idlers
-    # has trailing undef elements. In this case we do not need to kill
-    # anyone.
-    my @idlers = (keys %idle)[0 .. --$plus];
-    kill 'TERM', @idlers if $idlers[-1];
+    _kill_idlers($plus);
   }
 
   _log_child_status() if $debug;
@@ -191,8 +193,7 @@ sub pf_kid_new () {
     }
     elsif ((my $plus = $num_idle - $max_spare_servers) > 0) {
       _log_child_action('Killing', $plus) if $debug;
-      my @idlers = (keys %idle)[0 .. --$plus];
-      kill 'TERM', @idlers if $idlers[-1];
+      _kill_idlers($plus);
     }
 
     _log_child_status() if $debug;
@@ -277,7 +278,10 @@ sub _make_child_sigh {
   if (%$child_sigh) {
     my %sig2hnd;
     while (my ($sigs, $code) = each %$child_sigh) {
-      ref $code eq 'CODE' or die "child_sigh: $code is not a code reference";
+      if (defined $code &&
+          ref $code ne 'CODE' && $code !~ /^(?:DEFAULT|IGNORE)$/) {
+        die "child_sigh($sigs) must be a code ref, DEFAULT, IGNORE or undef";
+      }
       for (split ' ', $sigs) {
         $sig2hnd{$_} =
           exists $SIG{$_} ? $code : die "child_sigh: No such signal: $_";
@@ -289,10 +293,40 @@ sub _make_child_sigh {
   return undef;
 }
 
-sub _make_socketpair {
+sub _socketpair {
   socketpair $_[0], $_[1], AF_UNIX, SOCK_STREAM, PF_UNSPEC
     or die "ERROR: socketpair(): $!\n";
   fcntl $_[1], F_SETFL, fcntl($_[1], F_GETFL, 0) | O_NONBLOCK;
+}
+
+sub _fork_data_hook_helper {
+  my ($parent_data_fh, $child_data_fh) = @_;
+
+  sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
+
+  my $cpid = fork() // die "Could not fork: $!";
+
+  if ($cpid) {
+    sigprocmask(SIG_SETMASK, $sigset_bak);
+    return $cpid;
+  }
+
+  undef $parent_data_fh;
+  $0 .= ' [data_hook_helper]';
+
+  $child_fds = '';
+  vec($child_fds, fileno $child_data_fh, 1) = 1;
+
+  while (my ($sig, $hnd) = each %SIG) {
+    undef $SIG{$sig} if defined $hnd && $sig ne 'FPE';
+  }
+
+  while (1) {
+    sigprocmask(SIG_SETMASK, $sigset_bak);
+    select my $rfds = $child_fds, undef, undef, undef;
+    sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
+    _read_child_data();
+  }
 }
 
 sub _spawn {
@@ -336,9 +370,48 @@ sub _spawn {
   $cpid;
 }
 
+sub _sig_chld {
+  # force select() to return immediately if child exited shortly before
+  $timeout = 0;
+}
+
+sub _wait_for_children {
+  my $ct;
+  while ((my $pid = waitpid -$pgid, WNOHANG) > 0) {
+    if ($pid == $dhook_pid) {
+      warn "ERROR: data_hook_helper exited, forking new one.\n";
+      $dhook_pid = _fork_data_hook_helper($parent_data_fh, $child_data_fh);
+    }
+    else {
+      delete $busy{$pid} and $num_busy--;
+      delete $idle{$pid} and $num_idle--;
+      warn "PID $pid exited.\n" if $debug;
+    }
+    $ct++;
+  }
+  $ct;
+}
+
+sub _read_child_drool {
+  my $status_changed;
+  while (1) {
+    if (select(my $rfds = $child_fds, undef, undef, $timeout) || !$timeout) {
+      sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
+      _read_child_data() if $dhook_in_main;
+      $status_changed =_read_child_status();
+      sigprocmask(SIG_SETMASK, $sigset_bak);
+    }
+    $timeout = 1;
+    last if _wait_for_children() || $status_changed;
+  }
+}
+
+# An in-memory scoreboard would surely be nicer ...
 sub _read_child_status {
+  my $ct;
   while (<$child_stat_fh>) {
     my ($status, $pid) = unpack 'aA*';
+    # Ignore delayed status messages from no longer existing children
     next unless $busy{$pid} or $idle{$pid};
     if ($status eq 'R') {
       delete $idle{$pid} and $num_idle--;
@@ -351,13 +424,20 @@ sub _read_child_status {
     elsif ($status ne '0') { # 0 = Jeffries tube. cg use only!
       warn "ERROR: Dubious status: $_";
     }
+    $ct++;
   }
+  $ct;
 }
 
 sub _read_child_data {
   return undef unless $child_data_fh && fileno $child_data_fh;
 
-  while (sysread $child_data_fh, my $header, CLD_DATA_HDR_LEN) {
+  my $nbytes = 0;
+  # read at most that many data chunks per call
+  my $chunks = $dhook_in_main ? 3 : ~0;
+
+ HDR:
+  while ($chunks-- && sysread $child_data_fh, my $header, CLD_DATA_HDR_LEN) {
     my ($pid, $exitcode, $thaw, $data_len) = unpack CLD_DATA_HDR_FMT, $header;
 
     # Exit code 256 means "undef", minimum nfreeze() data length is 3.
@@ -365,70 +445,44 @@ sub _read_child_data {
       warn(
         'ERROR: read corrupted child data: ',
         "pid:$pid exitcode:$exitcode thaw:$thaw data_len:$data_len",
-        ", skipping all pending data"
+        ', skipping all pending data'
       );
-      1 while sysread $child_data_fh, $header, 16384;
-      last;
+      $nbytes += sysread($child_data_fh, $header, 16384) || last HDR while 1;
     }
 
-    my $nbytes = sysread $child_data_fh, (my $data), $data_len;
-    if (! defined $nbytes) {
+    my $cbytes = sysread($child_data_fh, (my $data), $data_len) // do {
       warn "ERROR: sysread(): $!";
+      next HDR;
+    };
+
+    $nbytes += $cbytes;
+
+    if ($cbytes != $data_len) {
+      warn "ERROR: sysread(): read $cbytes bytes but expected $data_len";
+      next HDR;
     }
-    elsif ($nbytes != $data_len) {
-      warn "ERROR: sysread(): read $nbytes bytes but expected $data_len";
-    }
-    else {
-      $child_data_hook->(
-        $pid,
-        ($thaw ? eval { thaw $data } : $data) //
-          do {
-            warn "ERROR: Could not thaw() data from pid $pid: ", $@;
-            $error = $data;
-            undef;
-          },
-        $exitcode <= 255 ? $exitcode : undef,
-      );
-    }
-    return $nbytes;
+
+    $child_data_hook->(
+      $pid,
+      ($thaw ? eval { thaw $data } : $data) //
+        do {
+          warn "ERROR: Could not thaw() data from pid $pid: ", $@;
+          $error = $data;
+          undef;
+        },
+      $exitcode <= 255 ? $exitcode : undef,
+    );
   }
 
-  return undef;
+  $nbytes;
 }
 
-sub _read_child_drool {
-  select my $readfds = $child_fds, undef, undef, $timeout;
+sub _kill_idlers {
+  my $plus = shift;
 
-  _wait_for_children(WNOHANG) if $got_sigchld;
-
-  sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
-  _read_child_status();
-  _read_child_data();
-  sigprocmask(SIG_SETMASK, $sigset_bak);
-
-  _wait_for_children(WNOHANG) if $got_sigchld;
-}
-
-sub _sig_chld {
-  $timeout = 0;
-  ++$got_sigchld;
-}
-
-sub _wait_for_children {
-  my $flags = shift // 0;
-
-  sigprocmask(SIG_BLOCK, $sigset_chld, $sigset_bak);
-
-  while ((my $pid = waitpid -$pgid, $flags) > 0) {
-    delete $busy{$pid} and $num_busy--;
-    delete $idle{$pid} and $num_idle--;
-    warn "PID $pid exited.\n" if $debug;
-  }
-
-  undef $got_sigchld;
-  undef $timeout;
-
-  sigprocmask(SIG_SETMASK, $sigset_bak);
+  $num_idle -= $plus;
+  kill 'TERM', my @idlers = (keys %idle)[0 .. --$plus];
+  delete @idle{@idlers};
 }
 
 sub _log_child_action {
@@ -465,6 +519,7 @@ self-regulating, multi-purpose multi-processing module. Period.
     max_spare_servers => 4,
     start_servers => 3,
     max_servers => 20,
+    data_hook_in_main => 0,
     child_data_hook => sub {
       my ($pid, $data, $exitcode) = @_;
       print "$pid ", Dumper($data), "\n";
@@ -524,7 +579,7 @@ reported by the child processes. The child processes can send the main process
 
 By default, all functions described below are exported.
 
-=head2 pf_init (%options)
+=head2 pf_init ( %options )
 
 Initialization. Creates a process group (see NOTES), sets up internal child
 communications channels, reaps potentially left-over child processes and
@@ -539,7 +594,7 @@ Maximum total number of child processes Default: 73.
 =head3 max_spare_servers
 
 Maximum number of idle child processes. Surplus idle child processes will
-receive a SIGTERM. Default: 10.
+receive a SIGTERM (and are supposed to obey it). Default: 10.
 
 =head3 min_spare_servers
 
@@ -553,21 +608,37 @@ pf_kid_new(). Default: 5.
 =head3 child_sigh
 
 Signal handlers to be installed in the child. Hash reference holding space
-separated signal names as keys and code references as values, e.g: C<{ HUP
-=E<gt> $code, 'INT TERM' =E<gt> $code }>. Default: undef.
+separated signal names as keys and code references or the special strings
+'DEFAULT' or 'IGNORE' as values, e.g: C<{ HUP =E<gt> $code, 'INT TERM' =E<gt>
+'DEFAULT' }>. Default: undef.
+
+Any SIGTERM handler should cause the child process to exit sooner or later.
 
 =head3 child_data_hook
 
-Code reference called by the main process when a child calls pf_kid_yell() or
-pf_kid_exit() with a C<$data> argument. Receives child pid, data and exit code
-as arguments (in this order). The exit code is undef for pf_kid_yell().
+Code reference to be called when a child calls pf_kid_yell() or pf_kid_exit()
+with a C<$data> argument. Receives child pid, data and exit code as arguments
+(in this order). The exit code is undef for pf_kid_yell().
 
 If thaw() was requested (see pf_kid_yell() and pf_kid_exit()) and failed,
 $data is undef and $Parallel::MPM::Prefork::error contains the original data
 from Storable::nfreeze().
 
-Note that this hook executes in the main process and thus may slow down child
-process handling, so keep the code and data as small as possible
+This hook is executed in a dedicated child process unless data_hook_in_main is
+set to true.
+
+=head3 data_hook_in_main
+
+Boolean value. If false (the default), a separate child process reads child
+data from pf_kid_yell() and pf_kid_exit() and executes child_data_hook. If
+true, this is done in the main process.
+
+Note that if you set this to true, a long-running or heavily used
+child_data_hook will slow down the child process management of the main
+process. Putting it in a separate process only affects the performance of the
+child processes.
+
+=back
 
 =head2 pf_whip_kids () and pf_kid_new ()
 
@@ -601,7 +672,7 @@ via C<exit(0)>.
 =head3 $args (optional)
 
 Array reference holding arguments to be passed when $code is called
-(C<$code->(@$args)>).
+(C<$code-E<gt>(@$args)>).
 
 =head2 pf_kid_new ()
 
@@ -721,8 +792,7 @@ waitpid($pid, ...) in the main process.
 
 system(LIST) can be replaced by system('setsid', LIST);
 
-However, Parallel::MPM::Prefork will still catch your SIGCHLD (see previous
-note).
+However, Parallel::MPM::Prefork will still catch SIGCHLD (see previous note).
 
 =head2 Difference to Parallel::ForkManager
 

@@ -1,5 +1,12 @@
 Revision history for Parallel-MPM-Prefork
 
+0.10  2013-08-17
+* Tuned SIGCHLD handling again (thanks to the ASF for their merciless "ab").
+* Added support for DEFAULT, IGNORE and undef child signal handlers.
+* _read_child_data(): Read more than one data chunk per call but not too many.
+* Execute child_data_hook in separate process unless data_hook_in_main is true.
+* t/02-data_hook.t needs data_hook_in_main => 1.
+
 0.09  2013-08-15
 * Include Perl 5.10 as requirement in Build.PL
 * Don't import POSIX::_exit, we don't need it.

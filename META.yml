@@ -16,9 +16,9 @@ name: Parallel-MPM-Prefork
 provides:
   Parallel::MPM::Prefork:
     file: lib/Parallel/MPM/Prefork.pm
-    version: 0.09
+    version: 0.10
 requires:
   perl: 5.010
 resources:
   license: http://dev.perl.org/licenses/
-version: 0.09
+version: 0.10

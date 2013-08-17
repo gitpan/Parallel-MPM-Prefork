@@ -27,6 +27,7 @@ sub test_data_hook {
     min_spare_servers => 1,
     max_spare_servers => 2,
     start_servers => 1,
+    data_hook_in_main => 1,
     child_data_hook => sub {
       ($cpid_read, $data_read, $exit_code_read) = @_
     },
