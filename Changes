@@ -1,4 +1,9 @@
-Revision history for Parallel-MPM-Prefork
+Revision history for Parallel::MPM::Prefork
+
+0.11  2013-08-18
+* Don't block signals during child_data_hook call.
+* Fixed examination of select() mask.
+* Cleaned up sigprocmask() overoptimization.
 
 0.10  2013-08-17
 * Tuned SIGCHLD handling again (thanks to the ASF for their merciless "ab").

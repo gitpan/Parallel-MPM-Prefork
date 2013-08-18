@@ -34,7 +34,7 @@ our @EXPORT =
       pf_kid_exit
   );
 
-our $VERSION = '0.10';
+our $VERSION = '0.11';
 our $error;
 
 my $pgid;
@@ -52,7 +52,11 @@ my $parent_stat_fh;
 my $parent_data_fh;
 
 my $child_stat_fh;
+my $child_stat_fd;
+
 my $child_data_fh;
+my $child_data_fd;
+
 my $child_fds;
 
 my $child_data_hook;
@@ -81,9 +85,9 @@ sub pf_init {
     setpgrp();
     $pgid = getpgrp();
 
-    $child_fds = $error = '';
     $timeout = $am_parent = 1;
     $dhook_pid = $done = $num_busy = $num_idle = 0;
+    $child_fds = $child_stat_fd = $child_data_fd = $error = '';
 
     undef %busy;
     undef %idle;
@@ -132,7 +136,8 @@ sub pf_init {
     if ($child_data_hook) {
       _socketpair($parent_data_fh, $child_data_fh);
       if ($dhook_in_main) {
-        vec($child_fds, fileno $child_data_fh, 1) = 1;
+        vec($child_data_fd, fileno $child_data_fh, 1) = 1;
+        $child_fds |= $child_data_fd;
       }
       else {
         $dhook_pid = _fork_data_hook_helper($parent_data_fh, $child_data_fh);
@@ -140,7 +145,8 @@ sub pf_init {
     }
 
     _socketpair($parent_stat_fh, $child_stat_fh);
-    vec($child_fds, fileno $child_stat_fh, 1) = 1;
+    vec($child_stat_fd, fileno $child_stat_fh, 1) = 1;
+    $child_fds |= $child_stat_fd;
 
     $SIG{CHLD} = \&_sig_chld;
     _wait_for_children()
@@ -254,8 +260,8 @@ sub pf_done (;$) {
   undef $child_fds if ! $child_stat_fh;
 
   do {
-    $nbytes = _read_child_data();
     $pid = waitpid -$pgid, WNOHANG if $pid >= 0;
+    $nbytes = _read_child_data();
     select my $rfds = $child_fds, undef, undef, .1 if !($pid || $nbytes);
   } while $pid >= 0 || $nbytes;
 
@@ -321,10 +327,10 @@ sub _fork_data_hook_helper {
     undef $SIG{$sig} if defined $hnd && $sig ne 'FPE';
   }
 
+  sigprocmask(SIG_SETMASK, $sigset_bak);
+
   while (1) {
-    sigprocmask(SIG_SETMASK, $sigset_bak);
     select my $rfds = $child_fds, undef, undef, undef;
-    sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
     _read_child_data();
   }
 }
@@ -394,21 +400,23 @@ sub _wait_for_children {
 
 sub _read_child_drool {
   my $status_changed;
-  while (1) {
+  do {
     if (select(my $rfds = $child_fds, undef, undef, $timeout) || !$timeout) {
-      sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
-      _read_child_data() if $dhook_in_main;
-      $status_changed =_read_child_status();
-      sigprocmask(SIG_SETMASK, $sigset_bak);
+      $status_changed = unpack '%32b*', $rfds & $child_stat_fd;
+      if ($dhook_in_main && unpack '%32b*', $rfds & $child_data_fd) {
+        _read_child_data();
+        $status_changed ||= select $rfds = $child_stat_fd, undef, undef, 0;
+      }
+      _read_child_status() if $status_changed;
     }
     $timeout = 1;
-    last if _wait_for_children() || $status_changed;
-  }
+  } until _wait_for_children() || $status_changed;
 }
 
 # An in-memory scoreboard would surely be nicer ...
 sub _read_child_status {
   my $ct;
+  sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
   while (<$child_stat_fh>) {
     my ($status, $pid) = unpack 'aA*';
     # Ignore delayed status messages from no longer existing children
@@ -426,6 +434,7 @@ sub _read_child_status {
     }
     $ct++;
   }
+  sigprocmask(SIG_SETMASK, $sigset_bak);
   $ct;
 }
 
@@ -433,8 +442,10 @@ sub _read_child_data {
   return undef unless $child_data_fh && fileno $child_data_fh;
 
   my $nbytes = 0;
-  # read at most that many data chunks per call
-  my $chunks = $dhook_in_main ? 3 : ~0;
+  my $chunks = $dhook_in_main ? 3 : ~0;  # read at most that many chunks per
+                                         # call
+
+  sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
 
  HDR:
   while ($chunks-- && sysread $child_data_fh, my $header, CLD_DATA_HDR_LEN) {
@@ -462,6 +473,8 @@ sub _read_child_data {
       next HDR;
     }
 
+    # Don't block signals in the data hook.
+    sigprocmask(SIG_SETMASK, $sigset_bak);
     $child_data_hook->(
       $pid,
       ($thaw ? eval { thaw $data } : $data) //
@@ -472,7 +485,10 @@ sub _read_child_data {
         },
       $exitcode <= 255 ? $exitcode : undef,
     );
+    sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak) if $chunks;
   }
+
+  sigprocmask(SIG_SETMASK, $sigset_bak);
 
   $nbytes;
 }
