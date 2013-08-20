@@ -19,8 +19,7 @@ perl Build.PL
 
 COPYRIGHT AND LICENSE
 
-Copyright © 2013 Carsten Gaebler (cgpan [ʇɐ] gmx [ʇop] de). All rights
-reserved.
+Copyright © 2013 Carsten Gaebler. All rights reserved. For details see POD text.
 
 This program is free software. You can redistribute and/or modify it under the
 same terms as Perl itself.

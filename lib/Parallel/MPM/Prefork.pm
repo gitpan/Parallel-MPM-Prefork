@@ -34,7 +34,7 @@ our @EXPORT =
       pf_kid_exit
   );
 
-our $VERSION = '0.11';
+our $VERSION = '0.12';
 our $error;
 
 my $pgid;
@@ -401,7 +401,7 @@ sub _wait_for_children {
 sub _read_child_drool {
   my $status_changed;
   do {
-    if (select(my $rfds = $child_fds, undef, undef, $timeout) || !$timeout) {
+    if (select my $rfds = $child_fds, undef, undef, $timeout) {
       $status_changed = unpack '%32b*', $rfds & $child_stat_fd;
       if ($dhook_in_main && unpack '%32b*', $rfds & $child_data_fd) {
         _read_child_data();
@@ -415,7 +415,6 @@ sub _read_child_drool {
 
 # An in-memory scoreboard would surely be nicer ...
 sub _read_child_status {
-  my $ct;
   sigprocmask(SIG_BLOCK, $sigset_all, $sigset_bak);
   while (<$child_stat_fh>) {
     my ($status, $pid) = unpack 'aA*';
@@ -432,10 +431,8 @@ sub _read_child_status {
     elsif ($status ne '0') { # 0 = Jeffries tube. cg use only!
       warn "ERROR: Dubious status: $_";
     }
-    $ct++;
   }
   sigprocmask(SIG_SETMASK, $sigset_bak);
-  $ct;
 }
 
 sub _read_child_data {
@@ -625,8 +622,8 @@ pf_kid_new(). Default: 5.
 
 Signal handlers to be installed in the child. Hash reference holding space
 separated signal names as keys and code references or the special strings
-'DEFAULT' or 'IGNORE' as values, e.g: C<{ HUP =E<gt> $code, 'INT TERM' =E<gt>
-'DEFAULT' }>. Default: undef.
+'DEFAULT' or 'IGNORE' as values, e.g: C<< { HUP => $code, 'INT TERM' =>
+'DEFAULT' } >>. Default: undef.
 
 Any SIGTERM handler should cause the child process to exit sooner or later.
 
@@ -653,8 +650,6 @@ Note that if you set this to true, a long-running or heavily used
 child_data_hook will slow down the child process management of the main
 process. Putting it in a separate process only affects the performance of the
 child processes.
-
-=back
 
 =head2 pf_whip_kids () and pf_kid_new ()
 
@@ -687,8 +682,8 @@ via C<exit(0)>.
 
 =head3 $args (optional)
 
-Array reference holding arguments to be passed when $code is called
-(C<$code-E<gt>(@$args)>).
+Array reference holding arguments to be passed when $code is called (C<<
+$code->(@$args) >>).
 
 =head2 pf_kid_new ()
 
@@ -849,8 +844,11 @@ Thanks to the UN for not condemning child labor on the operating system level.
 
 =head1 COPYRIGHT
 
-Copyright © 2013 Carsten Gaebler (cgpan [ʇɐ] gmx [ʇop] de). All rights
-reserved.
+Copyright © 2013 Carsten Gaebler (cgpan ʇɐ gmx ʇop de). All rights reserved.
+
+If you wish to send me an e-mail please encrypt it using my GPG key from the
+pubkey.asc file that comes with this distribution and provide me with your own
+key. Otherwise I will delete your message unread.
 
 =head1 LICENSE
 
