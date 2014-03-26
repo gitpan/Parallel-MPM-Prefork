@@ -34,7 +34,7 @@ our @EXPORT =
       pf_kid_exit
   );
 
-our $VERSION = '0.12';
+our $VERSION = '0.13';
 our $error;
 
 my $pgid;
@@ -846,9 +846,9 @@ Thanks to the UN for not condemning child labor on the operating system level.
 
 Copyright © 2013 Carsten Gaebler (cgpan ʇɐ gmx ʇop de). All rights reserved.
 
-If you wish to send me an e-mail please encrypt it using my GPG key from the
-pubkey.asc file that comes with this distribution and provide me with your own
-key. Otherwise I will delete your message unread.
+I only accept encrypted e-mails, either via
+L<SMIME|http://cpan.org/authors/id/C/CG/CGPAN/cgpan-smime.crt> or
+L<GPG|http://cpan.org/authors/id/C/CG/CGPAN/cgpan-gpg.asc>.
 
 =head1 LICENSE
 
