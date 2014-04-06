@@ -21,6 +21,8 @@ use constant {
 use constant CLD_DATA_HDR_FMT => 'iSCL'; # PID, exit code, thaw, data length
 use constant CLD_DATA_HDR_LEN => length pack CLD_DATA_HDR_FMT, 0;
 
+our $VERSION = '0.14';
+
 our (@EXPORT_OK, @EXPORT_TAGS) = ();
 our @EXPORT =
   qw(
@@ -34,7 +36,6 @@ our @EXPORT =
       pf_kid_exit
   );
 
-our $VERSION = '0.13';
 our $error;
 
 my $pgid;
@@ -517,8 +518,7 @@ __END__
 
 =head1 NAME
 
-Parallel::MPM::Prefork - A simple non-threaded, non-OO, pre-forking,
-self-regulating, multi-purpose multi-processing module. Period.
+Parallel::MPM::Prefork - A simple non-threaded, non-OO, pre-forking, self-regulating, multi-purpose multi-processing module. Period.
 
 =head1 SYNOPSIS
 

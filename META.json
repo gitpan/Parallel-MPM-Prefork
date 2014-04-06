@@ -1,5 +1,5 @@
 {
-   "abstract" : "A simple non-threaded, non-OO, pre-forking,",
+   "abstract" : "A simple non-threaded, non-OO, pre-forking, self-regulating, multi-purpose multi-processing module. Period.",
    "author" : [
       "Carsten Gaebler"
    ],
@@ -33,7 +33,7 @@
    "provides" : {
       "Parallel::MPM::Prefork" : {
          "file" : "lib/Parallel/MPM/Prefork.pm",
-         "version" : "0.13"
+         "version" : "0.14"
       }
    },
    "release_status" : "stable",
@@ -42,5 +42,5 @@
          "http://dev.perl.org/licenses/"
       ]
    },
-   "version" : "0.13"
+   "version" : "0.14"
 }
